@@ -4,18 +4,6 @@
 #include "g_local.h"
 
 
-typedef struct teamgame_s {
-	float			last_flag_capture;
-	int				last_capture_team;
-	flagStatus_t	redStatus;	// CTF
-	flagStatus_t	blueStatus;	// CTF
-	flagStatus_t	flagStatus;	// One Flag CTF
-	int				redTakenTime;
-	int				blueTakenTime;
-	int				redObeliskAttackedTime;
-	int				blueObeliskAttackedTime;
-} teamgame_t;
-
 teamgame_t teamgame;
 
 gentity_t	*neutralObelisk;
@@ -176,6 +164,23 @@ qboolean OnSameTeam( gentity_t *ent1, gentity_t *ent2 ) {
 static char ctfFlagStatusRemap[] = { '0', '1', '*', '*', '2' };
 static char oneFlagStatusRemap[] = { '0', '1', '2', '3', '4' };
 
+// Find the client number carrying the specified flag, or -1 if no one
+int Team_GetFlagCarrier( int flagPowerup ) {
+	int i;
+	gclient_t *cl;
+
+	for ( i = 0; i < level.maxclients; i++ ) {
+		cl = level.clients + i;
+		if ( cl->pers.connected != CON_CONNECTED ) {
+			continue;
+		}
+		if ( cl->ps.powerups[flagPowerup] ) {
+			return i;
+		}
+	}
+	return -1;
+}
+
 static void Team_SetFlagStatus( team_t team, flagStatus_t status ) {
 	qboolean modified = qfalse;
 
@@ -209,9 +214,19 @@ static void Team_SetFlagStatus( team_t team, flagStatus_t status ) {
 		char st[4];
 
 		if ( g_gametype.integer == GT_CTF ) {
+			int redCarrier, blueCarrier;
+
 			st[0] = ctfFlagStatusRemap[teamgame.redStatus];
 			st[1] = ctfFlagStatusRemap[teamgame.blueStatus];
 			st[2] = '\0';
+
+			// Update cvar for UDP getstatus queries (stats tools)
+			// Format: "<red_status>:<red_carrier>,<blue_status>:<blue_carrier>"
+			redCarrier = Team_GetFlagCarrier( PW_REDFLAG );
+			blueCarrier = Team_GetFlagCarrier( PW_BLUEFLAG );
+			trap_Cvar_Set( "g_flagStatus", va( "%d:%d,%d:%d",
+				teamgame.redStatus, redCarrier,
+				teamgame.blueStatus, blueCarrier ) );
 		} else {	// GT_1FCTF
 			st[0] = oneFlagStatusRemap[teamgame.flagStatus];
 			st[1] = '\0';
@@ -223,6 +238,7 @@ static void Team_SetFlagStatus( team_t team, flagStatus_t status ) {
 
 
 void Team_CheckDroppedItem( gentity_t *dropped ) {
+	// Note: FlagDrop logging moved to Drop_Item() to include player name
 	if( dropped->item->giTag == PW_REDFLAG ) {
 		Team_SetFlagStatus( TEAM_RED, FLAG_DROPPED );
 	}
@@ -652,6 +668,8 @@ void Team_ReturnFlag( team_t team ) {
 	else {
 		PrintMsg(NULL, "The %s flag has returned!\n", TeamName(team));
 	}
+	// Log auto-return (no player - timeout, suicide, or nodrop death)
+	G_LogPrintf( "FlagReturn: -1 %d:\n", team );
 }
 
 
@@ -720,8 +738,10 @@ static int Team_TouchOurFlag( gentity_t *ent, gentity_t *other, team_t team ) {
 
 	if ( ent->flags & FL_DROPPED_ITEM ) {
 		// hey, its not home.  return it by teleporting it back
-		PrintMsg( NULL, "%s" S_COLOR_WHITE " returned the %s flag!\n", 
+		PrintMsg( NULL, "%s" S_COLOR_WHITE " returned the %s flag!\n",
 			cl->pers.netname, TeamName(team));
+		G_LogPrintf( "FlagReturn: %d %d: %s\n",
+			other->client->ps.clientNum, team, cl->pers.netname );
 		AddScore(other, ent->r.currentOrigin, CTF_RECOVERY_BONUS);
 		other->client->pers.teamState.flagrecovery++;
 		other->client->pers.teamState.lastreturnedflag = level.time;
@@ -740,10 +760,14 @@ static int Team_TouchOurFlag( gentity_t *ent, gentity_t *other, team_t team ) {
 #ifdef MISSIONPACK
 	if( g_gametype.integer == GT_1FCTF ) {
 		PrintMsg( NULL, "%s" S_COLOR_WHITE " captured the flag!\n", cl->pers.netname );
+		G_LogPrintf( "FlagCapture: %d %d: %s\n",
+			other->client->ps.clientNum, team, cl->pers.netname );
 	}
 	else {
 #endif
 	PrintMsg( NULL, "%s" S_COLOR_WHITE " captured the %s flag!\n", cl->pers.netname, TeamName(OtherTeam(team)));
+	G_LogPrintf( "FlagCapture: %d %d: %s\n",
+		other->client->ps.clientNum, team, cl->pers.netname );
 #ifdef MISSIONPACK
 	}
 #endif
@@ -783,7 +807,7 @@ static int Team_TouchOurFlag( gentity_t *ent, gentity_t *other, team_t team ) {
 				AddScore(player, ent->r.currentOrigin, CTF_TEAM_BONUS);
 #endif
 			// award extra points for capture assists
-			if (player->client->pers.teamState.lastreturnedflag + 
+			if (player->client->pers.teamState.lastreturnedflag +
 				CTF_RETURN_FLAG_ASSIST_TIMEOUT > level.time) {
 				AddScore (player, ent->r.currentOrigin, CTF_RETURN_FLAG_ASSIST_BONUS);
 				other->client->pers.teamState.assists++;
@@ -794,8 +818,11 @@ static int Team_TouchOurFlag( gentity_t *ent, gentity_t *other, team_t team ) {
 				player->client->ps.eFlags |= EF_AWARD_ASSIST;
 				player->client->rewardTime = level.time + REWARD_SPRITE_TIME;
 
-			} 
-			if (player->client->pers.teamState.lastfraggedcarrier + 
+				G_LogPrintf( "Assist: %d %d return: %s\n",
+					player->client->ps.clientNum, player->client->sess.sessionTeam,
+					player->client->pers.netname );
+			}
+			if (player->client->pers.teamState.lastfraggedcarrier +
 				CTF_FRAG_CARRIER_ASSIST_TIMEOUT > level.time) {
 				AddScore(player, ent->r.currentOrigin, CTF_FRAG_CARRIER_ASSIST_BONUS);
 				other->client->pers.teamState.assists++;
@@ -804,6 +831,10 @@ static int Team_TouchOurFlag( gentity_t *ent, gentity_t *other, team_t team ) {
 				player->client->ps.eFlags &= ~(EF_AWARD_IMPRESSIVE | EF_AWARD_EXCELLENT | EF_AWARD_GAUNTLET | EF_AWARD_ASSIST | EF_AWARD_DEFEND | EF_AWARD_CAP );
 				player->client->ps.eFlags |= EF_AWARD_ASSIST;
 				player->client->rewardTime = level.time + REWARD_SPRITE_TIME;
+
+				G_LogPrintf( "Assist: %d %d frag: %s\n",
+					player->client->ps.clientNum, player->client->sess.sessionTeam,
+					player->client->pers.netname );
 			}
 		}
 	}
@@ -821,6 +852,8 @@ static int Team_TouchEnemyFlag( gentity_t *ent, gentity_t *other, team_t team ) 
 #ifdef MISSIONPACK
 	if( g_gametype.integer == GT_1FCTF ) {
 		PrintMsg (NULL, "%s" S_COLOR_WHITE " got the flag!\n", other->client->pers.netname );
+		G_LogPrintf( "FlagTaken: %d %d: %s\n",
+			other->client->ps.clientNum, TEAM_FREE, cl->pers.netname );
 
 		cl->ps.powerups[PW_NEUTRALFLAG] = INT_MAX; // flags never expire
 
@@ -835,6 +868,8 @@ static int Team_TouchEnemyFlag( gentity_t *ent, gentity_t *other, team_t team ) 
 #endif
 		PrintMsg (NULL, "%s" S_COLOR_WHITE " got the %s flag!\n",
 			other->client->pers.netname, TeamName(team));
+		G_LogPrintf( "FlagTaken: %d %d: %s\n",
+			other->client->ps.clientNum, team, cl->pers.netname );
 
 		if (team == TEAM_RED)
 			cl->ps.powerups[PW_REDFLAG] = INT_MAX; // flags never expire
